@@ -99,6 +99,17 @@ export interface InstallResult {
 }
 
 export function installSchedule(intervalSecs = DEFAULT_INTERVAL_SECS): InstallResult {
+  // launchd only. On Linux, writing a plist under ~/Library would report
+  // "installed" for a scheduler that never ticks — say so instead.
+  if (process.platform !== "darwin") {
+    return {
+      plistPath: SCHEDULE_PLIST,
+      intervalSecs,
+      loaded: false,
+      message:
+        "The task scheduler installs as a launchd agent (macOS only). On Linux, run `pai task poll` from a systemd user timer instead.",
+    };
+  }
   if (!existsSync(LAUNCH_AGENTS)) mkdirSync(LAUNCH_AGENTS, { recursive: true });
 
   const cli = cliPath();
@@ -131,7 +142,10 @@ export function uninstallSchedule(): string {
 
 export function scheduleStatus(): { installed: boolean; running: boolean; detail: string } {
   const installed = existsSync(SCHEDULE_PLIST);
-  if (!installed) return { installed: false, running: false, detail: "Not installed." };
+  if (!installed) {
+    const detail = process.platform === "darwin" ? "Not installed." : "Not installed (launchd scheduler is macOS only).";
+    return { installed: false, running: false, detail };
+  }
 
   const list = spawnSync("launchctl", ["list", SCHEDULE_LABEL], { encoding: "utf8" });
   const running = list.status === 0;

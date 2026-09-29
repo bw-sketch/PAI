@@ -3,9 +3,9 @@
  *
  * serve      — Start the PAI daemon in the foreground
  * status     — Query daemon status via IPC
- * restart    — Send SIGTERM to running daemon (launchd will restart it)
- * install    — Write launchd plist + update ~/.claude.json to use the shim
- * uninstall  — Remove launchd plist + revert ~/.claude.json to direct MCP
+ * restart    — Restart the daemon (launchd on macOS, systemd --user on Linux)
+ * install    — Write launchd plist (macOS) or systemd user unit (Linux) + update ~/.claude.json to use the shim
+ * uninstall  — Remove the launchd plist / systemd unit + revert ~/.claude.json to direct MCP
  * logs       — Tail the daemon log file
  */
 
@@ -43,6 +43,14 @@ const PLIST_LABEL = "com.pai.pai-daemon";
 const LAUNCH_AGENTS_DIR = join(HOME, "Library", "LaunchAgents");
 const PLIST_PATH = join(LAUNCH_AGENTS_DIR, `${PLIST_LABEL}.plist`);
 const DAEMON_LOG = daemonLogPath();
+
+// Linux has no launchd: the daemon runs as a systemd user unit instead. With
+// `loginctl enable-linger` it starts at boot and survives logout, which is what
+// an always-on server needs.
+const IS_LINUX = process.platform === "linux";
+const SYSTEMD_UNIT = "pai-daemon.service";
+const SYSTEMD_USER_DIR = join(process.env["XDG_CONFIG_HOME"] ?? join(HOME, ".config"), "systemd", "user");
+const SYSTEMD_UNIT_PATH = join(SYSTEMD_USER_DIR, SYSTEMD_UNIT);
 
 /**
  * Resolve the absolute path to the built daemon entry point.
@@ -117,6 +125,86 @@ function generatePlist(daemonBin: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// systemd user unit generation (Linux)
+// ---------------------------------------------------------------------------
+
+export function generateSystemdUnit(daemonBin: string, nodeBin = process.execPath): string {
+  // The unit runs with systemd's minimal environment, so PATH must carry
+  // everything the daemon shells out to (claude for session summaries, bun).
+  const path = [
+    join(HOME, ".bun", "bin"),
+    join(HOME, ".local", "bin"),
+    join(HOME, ".npm-global", "bin"),
+    dirname(nodeBin),
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+  ].join(":");
+  return `[Unit]
+Description=PAI daemon
+After=network-online.target
+
+[Service]
+ExecStart=${nodeBin} ${daemonBin} serve
+Restart=always
+RestartSec=3
+Environment=HOME=${HOME}
+Environment=PATH=${path}
+StandardOutput=append:${DAEMON_LOG}
+StandardError=append:${DAEMON_LOG}
+
+[Install]
+WantedBy=default.target
+`;
+}
+
+function systemctlUser(...args: string[]): { ok: boolean; out: string } {
+  const r = spawnSync("systemctl", ["--user", ...args], { encoding: "utf8" });
+  return { ok: r.status === 0, out: `${r.stdout ?? ""}${r.stderr ?? ""}`.trim() };
+}
+
+function installSystemdUnit(daemonBin: string): boolean {
+  mkdirSync(SYSTEMD_USER_DIR, { recursive: true });
+  try {
+    writeFileSync(SYSTEMD_UNIT_PATH, generateSystemdUnit(daemonBin), "utf8");
+    console.log(ok(`  Wrote systemd user unit: ${SYSTEMD_UNIT_PATH}`));
+  } catch (e) {
+    console.error(err(`  Failed to write unit: ${e}`));
+    return false;
+  }
+  systemctlUser("daemon-reload");
+  const en = systemctlUser("enable", "--now", SYSTEMD_UNIT);
+  if (en.ok) {
+    console.log(ok(`  Enabled and started ${SYSTEMD_UNIT}.`));
+  } else {
+    console.log(warn(`  systemctl --user enable --now ${SYSTEMD_UNIT}: ${en.out || "failed"}`));
+  }
+  const linger = spawnSync("loginctl", ["show-user", String(process.getuid?.() ?? ""), "-p", "Linger"], {
+    encoding: "utf8",
+  });
+  if (!(linger.stdout ?? "").includes("Linger=yes")) {
+    console.log(warn("  Linger is off — the daemon stops at logout. Enable with: loginctl enable-linger"));
+  }
+  return true;
+}
+
+function uninstallSystemdUnit(): void {
+  if (!existsSync(SYSTEMD_UNIT_PATH)) {
+    console.log(dim("  No systemd user unit found."));
+    return;
+  }
+  systemctlUser("disable", "--now", SYSTEMD_UNIT);
+  console.log(ok(`  Stopped and disabled ${SYSTEMD_UNIT}.`));
+  try {
+    unlinkSync(SYSTEMD_UNIT_PATH);
+    console.log(ok(`  Removed unit: ${SYSTEMD_UNIT_PATH}`));
+  } catch (e) {
+    console.log(warn(`  Could not remove unit: ${e}`));
+  }
+  systemctlUser("daemon-reload");
+}
+
+// ---------------------------------------------------------------------------
 // Command implementations
 // ---------------------------------------------------------------------------
 
@@ -179,6 +267,16 @@ async function cmdStatus(): Promise<void> {
 }
 
 function cmdRestart(): void {
+  if (IS_LINUX && existsSync(SYSTEMD_UNIT_PATH)) {
+    const r = systemctlUser("restart", SYSTEMD_UNIT);
+    if (r.ok) console.log(ok(`Restarted ${SYSTEMD_UNIT}.`));
+    else {
+      console.error(err(`systemctl --user restart ${SYSTEMD_UNIT}: ${r.out}`));
+      process.exitCode = 1;
+    }
+    return;
+  }
+
   // Find and signal the running daemon
   try {
     const result = spawnSync("pgrep", ["-f", "pai-daemon.*serve"], {
@@ -222,15 +320,7 @@ function cmdRestart(): void {
   }
 }
 
-function cmdInstall(): void {
-  const daemonBin = getDaemonBinPath();
-  const shimBin = getShimBinPath();
-
-  console.log();
-  console.log(bold("  PAI Daemon Install"));
-  console.log();
-
-  // 1. Write launchd plist
+function installLaunchdPlist(daemonBin: string): boolean {
   if (!existsSync(LAUNCH_AGENTS_DIR)) {
     mkdirSync(LAUNCH_AGENTS_DIR, { recursive: true });
   }
@@ -241,11 +331,10 @@ function cmdInstall(): void {
     console.log(ok(`  Wrote launchd plist: ${PLIST_PATH}`));
   } catch (e) {
     console.error(err(`  Failed to write plist: ${e}`));
-    process.exitCode = 1;
-    return;
+    return false;
   }
 
-  // 2. Load the plist (unload first in case it was already there)
+  // Load the plist (unload first in case it was already there)
   try {
     spawnSync("launchctl", ["unload", PLIST_PATH], { encoding: "utf8" });
     const loadResult = spawnSync("launchctl", ["load", PLIST_PATH], {
@@ -259,6 +348,23 @@ function cmdInstall(): void {
   } catch {
     console.log(warn("  Could not run launchctl. Load manually:"));
     console.log(dim(`    launchctl load ${PLIST_PATH}`));
+  }
+  return true;
+}
+
+function cmdInstall(): void {
+  const daemonBin = getDaemonBinPath();
+  const shimBin = getShimBinPath();
+
+  console.log();
+  console.log(bold("  PAI Daemon Install"));
+  console.log();
+
+  // 1+2. Install the service: a systemd user unit on Linux, a launchd plist on macOS
+  const installed = IS_LINUX ? installSystemdUnit(daemonBin) : installLaunchdPlist(daemonBin);
+  if (!installed) {
+    process.exitCode = 1;
+    return;
   }
 
   // 3. Update ~/.claude.json to use the shim
@@ -325,22 +431,26 @@ function cmdUninstall(): void {
   console.log(bold("  PAI Daemon Uninstall"));
   console.log();
 
-  // 1. Unload and remove plist
-  if (existsSync(PLIST_PATH)) {
-    try {
-      spawnSync("launchctl", ["unload", PLIST_PATH], { encoding: "utf8" });
-      console.log(ok("  Unloaded launchd plist."));
-    } catch {
-      console.log(warn("  Could not unload plist via launchctl."));
-    }
-    try {
-      unlinkSync(PLIST_PATH);
-      console.log(ok(`  Removed plist: ${PLIST_PATH}`));
-    } catch (e) {
-      console.log(warn(`  Could not remove plist: ${e}`));
-    }
+  // 1. Stop and remove the service
+  if (IS_LINUX) {
+    uninstallSystemdUnit();
   } else {
-    console.log(dim("  No launchd plist found."));
+    if (existsSync(PLIST_PATH)) {
+      try {
+        spawnSync("launchctl", ["unload", PLIST_PATH], { encoding: "utf8" });
+        console.log(ok("  Unloaded launchd plist."));
+      } catch {
+        console.log(warn("  Could not unload plist via launchctl."));
+      }
+      try {
+        unlinkSync(PLIST_PATH);
+        console.log(ok(`  Removed plist: ${PLIST_PATH}`));
+      } catch (e) {
+        console.log(warn(`  Could not remove plist: ${e}`));
+      }
+    } else {
+      console.log(dim("  No launchd plist found."));
+    }
   }
 
   // 2. Revert ~/.claude.json to legacy direct MCP
@@ -507,7 +617,7 @@ export function registerDaemonCommands(daemonCmd: Command): void {
 
   daemonCmd
     .command("restart")
-    .description("Send SIGTERM to the running daemon (launchd will restart it)")
+    .description("Restart the daemon (launchd on macOS, systemd --user on Linux)")
     .action(() => {
       cmdRestart();
     });
@@ -515,7 +625,7 @@ export function registerDaemonCommands(daemonCmd: Command): void {
   daemonCmd
     .command("install")
     .description(
-      "Install daemon as a launchd service and update ~/.claude.json to use the shim"
+      "Install daemon as a launchd (macOS) or systemd user (Linux) service and update ~/.claude.json to use the shim"
     )
     .action(() => {
       cmdInstall();
@@ -523,7 +633,7 @@ export function registerDaemonCommands(daemonCmd: Command): void {
 
   daemonCmd
     .command("uninstall")
-    .description("Remove the launchd service and revert to direct MCP")
+    .description("Remove the launchd/systemd service and revert to direct MCP")
     .action(() => {
       cmdUninstall();
     });

@@ -21,6 +21,8 @@ export class MacOsProvider implements NotificationProvider {
   ): Promise<boolean> {
     const cfg = config.channels.macos;
     if (!cfg.enabled) return false;
+    // osascript exists only on macOS; elsewhere this channel is a clean no-op.
+    if (process.platform !== "darwin") return false;
 
     try {
       const title = payload.title ?? "PAI";
