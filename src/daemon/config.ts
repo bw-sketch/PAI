@@ -8,7 +8,7 @@
  * Expands ~ in path values at runtime.
  */
 
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { join, dirname } from "node:path";
 import type { NotificationConfig } from "../notifications/types.js";
@@ -374,7 +374,11 @@ export type ConfigMigrateResult = MigrateFileResult;
  * config.json.migrated-<YYYYMMDD> (never deleted).
  */
 export function migrateConfigFile(opts: { dryRun?: boolean } = {}): ConfigMigrateResult {
-  return migratePaiFile(NEW_CONFIG_FILE, [OLD_CONFIG_FILE, LEGACY_CONFIG_FILE], opts);
+  const result = migratePaiFile(NEW_CONFIG_FILE, [OLD_CONFIG_FILE, LEGACY_CONFIG_FILE], opts);
+  // The byte-for-byte copy keeps the source's mode, often 0644; this file carries
+  // the Postgres password.
+  if (!opts.dryRun && existsSync(NEW_CONFIG_FILE)) chmodSync(NEW_CONFIG_FILE, 0o600);
+  return result;
 }
 
 // ---------------------------------------------------------------------------

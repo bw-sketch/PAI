@@ -90,7 +90,8 @@ export function writeDualFormatConfigRaw(
     }
     return;
   }
-  writeJsonAtomic(jsonPath, raw, { label: jsonPath });
+  // 0600: config.json carries the Postgres connection string, password included.
+  writeJsonAtomic(jsonPath, raw, { label: jsonPath, mode: 0o600 });
 }
 
 // ---------------------------------------------------------------------------

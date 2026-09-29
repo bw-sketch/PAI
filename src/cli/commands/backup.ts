@@ -117,8 +117,9 @@ export function registerBackupCommands(program: Command): void {
       if (existsSync(CONFIG_FILE)) {
         const dest = join(backupDir, "config.json");
         try {
-          const { copyFileSync } = await import("node:fs");
+          const { copyFileSync, chmodSync } = await import("node:fs");
           copyFileSync(CONFIG_FILE, dest);
+          chmodSync(dest, 0o600); // carries the Postgres password
           results.push({ label: "Config", path: dest, size: fileSize(dest), status: ok("ok") });
         } catch (e) {
           results.push({ label: "Config", path: dest, size: "-", status: err(`failed: ${e}`) });

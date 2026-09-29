@@ -17,6 +17,7 @@ import {
   readdirSync,
   statSync,
   copyFileSync,
+  chmodSync,
   mkdirSync,
   readFileSync,
 } from "node:fs";
@@ -187,6 +188,7 @@ export function registerRestoreCommands(program: Command): void {
         try {
           mkdirSync(dirname(CONFIG_FILE), { recursive: true });
           copyFileSync(join(resolvedDir, "config.json"), CONFIG_FILE);
+          chmodSync(CONFIG_FILE, 0o600); // carries the Postgres password
           results.push({ label: "Config", status: ok("restored") });
         } catch (e) {
           results.push({ label: "Config", status: err(`failed: ${e}`) });

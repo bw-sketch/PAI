@@ -684,7 +684,7 @@ export function migrateWorkersToYaml(
   const priorWorkers = (raw.workers as Record<string, unknown>) ?? {};
   const { providers: _p, classes: _c, roles: _r, mcpSets: _m, active: _a, ...rest } = priorWorkers;
   raw.workers = rest;
-  writeJsonAtomic(jsonPath, raw, { label: jsonPath });
+  writeJsonAtomic(jsonPath, raw, { label: jsonPath, mode: 0o600 });
 
   return { yamlPath, yamlText, backupPath, dryRun: false };
 }

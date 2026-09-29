@@ -4,7 +4,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterAll } from "vitest";
-import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -79,6 +79,19 @@ describe("writeDualFormatConfigRaw", () => {
     writeDualFormatConfigRaw(jsonPath, { logLevel: "debug" });
 
     expect(JSON.parse(readFileSync(jsonPath, "utf-8"))).toEqual({ logLevel: "debug" });
+  });
+
+  it("keeps config.json and its backup at 0600 — it carries the Postgres password", () => {
+    // 2026-09-29: the daemon rewrote a 0600 config.json as 0644 on S1, exposing
+    // the database password to every local user.
+    const dir = newDir();
+    const jsonPath = join(dir, "config.json");
+    writeFileSync(jsonPath, JSON.stringify({ logLevel: "info" }), { mode: 0o644 });
+
+    writeDualFormatConfigRaw(jsonPath, { logLevel: "debug" });
+
+    expect(statSync(jsonPath).mode & 0o777).toBe(0o600);
+    expect(statSync(`${jsonPath}.bak-pai`).mode & 0o777).toBe(0o600);
   });
 });
 

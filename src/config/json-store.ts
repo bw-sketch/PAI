@@ -31,6 +31,7 @@ import {
   readFileSync,
   writeFileSync,
   copyFileSync,
+  chmodSync,
   renameSync,
   unlinkSync,
   mkdirSync,
@@ -97,13 +98,17 @@ function schemaDumpHits(data: Record<string, unknown>): number {
  * and renames. Rename is atomic within a filesystem, so a crash mid-write
  * leaves the original intact rather than truncated — which is how these files
  * become corrupt in the first place.
+ *
+ * `mode` (e.g. 0o600 for config.json, which carries the Postgres password)
+ * applies to the new file and its `.bak-pai` copy. Without it the umask decides,
+ * which on a stock system means world-readable 0644.
  */
 export function writeJsonAtomic(
   path: string,
   data: Record<string, unknown>,
-  opts: { backup?: boolean; label?: string } = {}
+  opts: { backup?: boolean; label?: string; mode?: number } = {}
 ): void {
-  const { backup = true, label = path } = opts;
+  const { backup = true, label = path, mode } = opts;
   if (schemaDumpHits(data) >= 3) {
     throw new Error(
       `${label}: refusing to write — the object looks like a type schema, not values ` +
@@ -120,6 +125,7 @@ export function writeJsonAtomic(
   if (backup && existsSync(path)) {
     try {
       copyFileSync(path, `${path}.bak-pai`);
+      if (mode !== undefined) chmodSync(`${path}.bak-pai`, mode);
     } catch (e) {
       throw new Error(
         `Could not back up ${label}: ${e instanceof Error ? e.message : String(e)}\n` +
@@ -130,8 +136,10 @@ export function writeJsonAtomic(
 
   const tmp = `${path}.tmp-pai-${process.pid}`;
   try {
-    writeFileSync(tmp, serialized, "utf8");
+    writeFileSync(tmp, serialized, mode === undefined ? "utf8" : { encoding: "utf8", mode });
     renameSync(tmp, path);
+    // writeFileSync's mode is masked by the umask and ignored for existing files.
+    if (mode !== undefined) chmodSync(path, mode);
   } catch (e) {
     try { if (existsSync(tmp)) unlinkSync(tmp); } catch { /* best effort */ }
     throw new Error(
