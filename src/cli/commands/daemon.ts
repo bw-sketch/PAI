@@ -53,24 +53,35 @@ const SYSTEMD_USER_DIR = join(process.env["XDG_CONFIG_HOME"] ?? join(HOME, ".con
 const SYSTEMD_UNIT_PATH = join(SYSTEMD_USER_DIR, SYSTEMD_UNIT);
 
 /**
- * Resolve the absolute path to the built daemon entry point.
- * tsdown bundles into dist/daemon/index.mjs (or similar).
- * From dist/cli/index.mjs → dist/ → dist/daemon/index.mjs
+ * Resolve a built entry point under dist/ (e.g. "daemon/index.mjs").
+ *
+ * "../daemon/index.mjs" relative to import.meta.url assumed this module lives in
+ * dist/cli/. The bundler emits it into a shared chunk at dist/ root instead, so
+ * that resolved to <pkg>/daemon/index.mjs — outside dist/ — and `pai daemon
+ * install` wrote a service around a file that does not exist. Walk up until
+ * dist/<rel> is found, the same way the scheduler locates the CLI.
  */
-function getDaemonBinPath(): string {
-  const __filename = fileURLToPath(import.meta.url);
-  const __dirname = dirname(__filename);
-  return join(__dirname, "../daemon/index.mjs");
+function distEntry(rel: string): string {
+  let dir = dirname(fileURLToPath(import.meta.url));
+  for (let i = 0; i < 6; i++) {
+    for (const candidate of [join(dir, "dist", rel), join(dir, rel)]) {
+      if (existsSync(candidate)) return candidate;
+    }
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return join(dirname(fileURLToPath(import.meta.url)), "..", rel);
 }
 
-/**
- * Resolve the absolute path to the built MCP shim entry point.
- * dist/cli/index.mjs → dist/ → dist/daemon-mcp/index.mjs
- */
+/** Absolute path to the built daemon entry point (dist/daemon/index.mjs). */
+function getDaemonBinPath(): string {
+  return distEntry(join("daemon", "index.mjs"));
+}
+
+/** Absolute path to the built MCP shim entry point (dist/daemon-mcp/index.mjs). */
 function getShimBinPath(): string {
-  const __filename = fileURLToPath(import.meta.url);
-  const __dirname = dirname(__filename);
-  return join(__dirname, "../daemon-mcp/index.mjs");
+  return distEntry(join("daemon-mcp", "index.mjs"));
 }
 
 // ---------------------------------------------------------------------------
