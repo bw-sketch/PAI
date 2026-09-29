@@ -275,6 +275,55 @@ export class PostgresBackend implements StorageBackend {
       await pool.query("ALTER TABLE pai_chunks ADD COLUMN last_accessed_at BIGINT");
       process.stderr.write("[pai-postgres] Migration: added last_accessed_at column to pai_chunks\n");
     }
+
+    await PostgresBackend.migrateFtsToSimple(pool);
+  }
+
+  /**
+   * Migration: build fts_vector with the 'simple' config, the one every query uses.
+   *
+   * init.sql's trigger used 'english', so every stored vector was stemmed
+   * ("sourceone" → 'sourceon', "reports" → 'report') while searchKeyword queries
+   * with to_tsquery('simple', …). Any word the English stemmer changes could
+   * never match, and German text was mangled on top. The trigger fires BEFORE
+   * INSERT, so it also overwrote the 'simple' vector the backend inserts.
+   *
+   * Replaces the trigger function and rebuilds every vector in one transaction,
+   * so an interrupted run is simply repeated on the next start. Gated on the
+   * function body still calling to_tsvector('english', …) — a no-op once migrated.
+   */
+  private static async migrateFtsToSimple(pool: Pool): Promise<void> {
+    const fn = await pool.query<{ src: string }>(
+      "SELECT prosrc AS src FROM pg_proc WHERE proname = 'pai_chunks_fts_update'"
+    );
+    if (!fn.rows.some((r) => r.src.includes("to_tsvector('english'"))) return;
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(`
+        CREATE OR REPLACE FUNCTION pai_chunks_fts_update()
+        RETURNS TRIGGER AS $$
+        BEGIN
+          NEW.fts_vector := to_tsvector('simple', COALESCE(NEW.text, ''));
+          RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql
+      `);
+      // The trigger fires only on UPDATE OF text, so set the column explicitly.
+      const res = await client.query(
+        "UPDATE pai_chunks SET fts_vector = to_tsvector('simple', COALESCE(text, ''))"
+      );
+      await client.query("COMMIT");
+      process.stderr.write(
+        `[pai-postgres] Migration: fts_vector rebuilt with 'simple' config (${res.rowCount} chunks)\n`
+      );
+    } catch (e) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw e;
+    } finally {
+      client.release();
+    }
   }
 
   constructor(config: PostgresConfig) {

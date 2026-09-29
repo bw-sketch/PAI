@@ -78,10 +78,12 @@ CREATE INDEX IF NOT EXISTS idx_pc_has_embedding ON pai_chunks (id)
 -- safety net for direct updates.
 -- ---------------------------------------------------------------------------
 
+-- 'simple', not a stemming config: queries use to_tsquery('simple', …), and
+-- stemmed vectors never match them ("sourceone" would be stored as 'sourceon').
 CREATE OR REPLACE FUNCTION pai_chunks_fts_update()
 RETURNS TRIGGER AS $$
 BEGIN
-  NEW.fts_vector := to_tsvector('english', COALESCE(NEW.text, ''));
+  NEW.fts_vector := to_tsvector('simple', COALESCE(NEW.text, ''));
   RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
